@@ -117,8 +117,9 @@ jobs:
           $root = $env:GITHUB_WORKSPACE
           Push-Location $root
           try {
-            & (Join-Path $root "out\Danica.exe") --self-test
-            if ($LASTEXITCODE -ne 0) { throw "The standalone resource self-test failed." }
+            $exe = Join-Path $root "out\Danica.exe"
+            $proc = Start-Process -FilePath $exe -ArgumentList "--self-test" -WorkingDirectory $root -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "The standalone resource self-test failed with exit code $($proc.ExitCode)." }
             $test = Join-Path $root "Danica-self-test.txt"
             if (!(Test-Path $test)) { throw "The self-test report was not produced." }
             Get-Content $test
