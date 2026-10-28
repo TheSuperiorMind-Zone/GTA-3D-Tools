@@ -13,134 +13,131 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Check out repository
+      - name: Check out isolated build branch
         uses: actions/checkout@v4
 
-      - name: Set up Python for Python-based projects
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Extract and build Danica
+      - name: Extract the original Danica bundle
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $root = $env:GITHUB_WORKSPACE
           $archive = Join-Path $root "Danica (Tools).rar"
-          $src = Join-Path $env:RUNNER_TEMP "danica-src"
-          $out = Join-Path $root "out"
+          $extract = Join-Path $env:RUNNER_TEMP "danica-original"
           $report = Join-Path $root "build-report.txt"
-          $log = Join-Path $root "build-log.txt"
-          $eol = [Environment]::NewLine
-          New-Item -ItemType Directory -Force -Path $src, $out | Out-Null
-          "Danica EXE build report" + $eol + "UTC: $([DateTime]::UtcNow.ToString('o'))" | Set-Content $report
+          if (!(Test-Path $archive)) { throw "Original archive missing: $archive" }
+
+          $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (!(Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+          }
+          if (!(Test-Path $sevenZip)) { throw "7-Zip was not installed." }
+
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          & $sevenZip x $archive "-o$extract" -y
+          if ($LASTEXITCODE -ne 0) { throw "RAR extraction failed with code $LASTEXITCODE." }
+
+          $src = Join-Path $extract "Danica (Tools)"
+          $toolDir = Join-Path $src "Convert"
+          foreach ($name in @("DFF.exe", "TXD.exe", "IFP.exe", "Texture.exe")) {
+            $p = Join-Path $toolDir $name
+            if (!(Test-Path $p)) { throw "Original converter missing after extraction: $p" }
+            $item = Get-Item $p
+            if ($item.Length -lt 10000) { throw "Original converter looks truncated: $p" }
+          }
+          $pack = Join-Path $src "Packs\Convert\GTA_PS2_TO_VC.pack"
+          if (!(Test-Path $pack)) { throw "GTA_PS2_TO_VC.pack is missing." }
+
+          @(
+            "Original archive: $archive"
+            "Extracted root: $src"
+            "DFF.exe: $((Get-Item (Join-Path $toolDir 'DFF.exe')).Length) bytes"
+            "TXD.exe: $((Get-Item (Join-Path $toolDir 'TXD.exe')).Length) bytes"
+            "IFP.exe: $((Get-Item (Join-Path $toolDir 'IFP.exe')).Length) bytes"
+            "Texture.exe: $((Get-Item (Join-Path $toolDir 'Texture.exe')).Length) bytes"
+            "Pack preset: GTA_PS2_TO_VC.pack"
+            "Source check: PASS"
+          ) | Set-Content $report
+          "DANICA_SRC=$src" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DANICA_TOOL_DIR=$toolDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DANICA_PACK=$pack" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install PyInstaller
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
+          python -m pip install pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller installation failed." }
+
+      - name: Build one-file Windows application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:GITHUB_WORKSPACE
+          $source = Join-Path $root "Danica-Standalone\danica_launcher.py"
+          $out = Join-Path $root "out"
+          $work = Join-Path $env:RUNNER_TEMP "danica-pyinstaller-work"
+          $spec = Join-Path $env:RUNNER_TEMP "danica-pyinstaller-spec"
+          if (!(Test-Path $source)) { throw "Launcher source missing: $source" }
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          python -m py_compile $source
+          if ($LASTEXITCODE -ne 0) { throw "Launcher syntax validation failed." }
+
+          $pyArgs = @(
+            "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+            "--name", "Danica", "--distpath", $out, "--workpath", $work, "--specpath", $spec
+          )
+          foreach ($name in @("DFF.exe", "TXD.exe", "IFP.exe", "Texture.exe")) {
+            $pyArgs += @("--add-binary", ((Join-Path $env:DANICA_TOOL_DIR $name) + ";Convert"))
+          }
+          $pyArgs += @("--add-data", ($env:DANICA_PACK + ";Packs\Convert"))
+          $pyArgs += $source
+
+          python @pyArgs
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with code $LASTEXITCODE." }
+          $exe = Join-Path $out "Danica.exe"
+          if (!(Test-Path $exe)) { throw "Build finished without out\Danica.exe." }
+          $item = Get-Item $exe
+          if ($item.Length -lt 500000) { throw "Danica.exe is unexpectedly small ($($item.Length) bytes)." }
+
+          "EXE size: $($item.Length) bytes" | Add-Content (Join-Path $root "build-report.txt")
+          "EXE SHA256: $((Get-FileHash $exe -Algorithm SHA256).Hash)" | Add-Content (Join-Path $root "build-report.txt")
+
+      - name: Validate bundled resources inside the EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:GITHUB_WORKSPACE
+          Push-Location $root
           try {
-            if (!(Test-Path $archive)) { throw "Source archive not found: $archive" }
-
-            $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
-            if (!(Test-Path $sevenZip)) {
-              choco install 7zip -y --no-progress | Out-File -Append $log
-            }
-            if (!(Test-Path $sevenZip)) { throw "7-Zip extractor is unavailable." }
-
-            "Source archive: $archive" | Add-Content $report
-            "Extracting archive..." | Tee-Object -FilePath $log -Append
-            & $sevenZip x $archive "-o$src" -y 2>&1 | Tee-Object -FilePath $log -Append
-            if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed with exit code $LASTEXITCODE." }
-
-            $files = @(Get-ChildItem $src -Recurse -File)
-            $inventory = $files | ForEach-Object {
-              $rel = $_.FullName.Substring($src.Length).TrimStart('\')
-              "{0,10}  {1}" -f $_.Length, $rel
-            }
-            ("Extracted files (" + $files.Count + "):" + $eol + ($inventory -join $eol)) | Add-Content $report
-            $files | Select-Object -ExpandProperty FullName | Set-Content (Join-Path $root "danica-file-list.txt")
-            if ($files.Count -eq 0) { throw "Archive extracted but contained no files." }
-
-            $projects = @($files | Where-Object { $_.Extension -ieq ".csproj" })
-            if ($projects.Count -gt 0) {
-              $project = $projects | Sort-Object @{Expression={ if ($_.BaseName -match "danica") { 0 } else { 1 } }}, FullName | Select-Object -First 1
-              "Build type: .NET project $($project.FullName)" | Tee-Object -FilePath $log -Append
-              $publish = Join-Path $env:RUNNER_TEMP "danica-publish"
-              dotnet publish $project.FullName -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o $publish 2>&1 | Tee-Object -FilePath $log -Append
-              if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
-              $built = Get-ChildItem $publish -Filter "*.exe" -File | Select-Object -First 1
-              if (!$built) { throw "dotnet publish completed but no EXE was produced." }
-              Copy-Item $built.FullName (Join-Path $out "Danica.exe") -Force
-            }
-            else {
-              $pythonFiles = @($files | Where-Object { $_.Extension -in @(".py", ".pyw") })
-              if ($pythonFiles.Count -gt 0) {
-                $entry = $pythonFiles | Where-Object { $_.BaseName -ieq "danica" } | Select-Object -First 1
-                if (!$entry) { $entry = $pythonFiles | Where-Object { $_.BaseName -ieq "main" } | Select-Object -First 1 }
-                if (!$entry) { $entry = $pythonFiles | Where-Object { $_.BaseName -ieq "app" } | Select-Object -First 1 }
-                if (!$entry) {
-                  $rootCandidates = @($pythonFiles | Where-Object { $_.DirectoryName -eq $src })
-                  if ($rootCandidates.Count -eq 1) { $entry = $rootCandidates[0] }
-                }
-                if (!$entry) { throw "Python files were found, but the entry point is ambiguous. See danica-file-list.txt and build-report.txt; no arbitrary script was selected." }
-
-                "Build type: PyInstaller; entry point: $($entry.FullName)" | Tee-Object -FilePath $log -Append
-                $requirements = $files | Where-Object { $_.Name -ieq "requirements.txt" } | Select-Object -First 1
-                if ($requirements) {
-                  python -m pip install --upgrade pip 2>&1 | Tee-Object -FilePath $log -Append
-                  if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
-                  python -m pip install -r $requirements.FullName 2>&1 | Tee-Object -FilePath $log -Append
-                  if ($LASTEXITCODE -ne 0) { throw "Installing requirements.txt failed." }
-                }
-                python -m pip install pyinstaller 2>&1 | Tee-Object -FilePath $log -Append
-                if ($LASTEXITCODE -ne 0) { throw "PyInstaller installation failed." }
-
-                $args = @("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--name", "Danica", "--distpath", $out, "--workpath", (Join-Path $env:RUNNER_TEMP "danica-pyinstaller-work"), "--specpath", (Join-Path $env:RUNNER_TEMP "danica-pyinstaller-spec"))
-                if ($entry.Extension -ieq ".pyw") { $args += "--windowed" }
-
-                foreach ($f in $files) {
-                  $ext = $f.Extension.ToLowerInvariant()
-                  $rel = $f.FullName.Substring($src.Length).TrimStart('\')
-                  if ($f.FullName -eq $entry.FullName) { continue }
-                  if ($rel -match '(^|\\)(__pycache__|\.git|tests?|testdata)(\\|$)') { continue }
-                  if ($ext -in @(".py", ".pyw", ".pyc", ".pyo", ".spec", ".cs", ".csproj", ".sln", ".md", ".rst", ".pdf")) { continue }
-                  $dest = Split-Path $rel -Parent
-                  if ([string]::IsNullOrWhiteSpace($dest)) { $dest = "." }
-                  if ($ext -eq ".dll") {
-                    $args += @("--add-binary", "$($f.FullName);$dest")
-                  }
-                  elseif ($ext -notin @(".exe", ".bat", ".cmd", ".ps1")) {
-                    $args += @("--add-data", "$($f.FullName);$dest")
-                  }
-                }
-                $args += $entry.FullName
-                python @args 2>&1 | Tee-Object -FilePath $log -Append
-                if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE." }
-                if (!(Test-Path (Join-Path $out "Danica.exe"))) { throw "PyInstaller finished without creating Danica.exe." }
-              }
-              else {
-                $types = $files | Group-Object Extension | Sort-Object Count -Descending | ForEach-Object { "$($_.Name): $($_.Count)" }
-                throw "No .NET project or Python entry point found. File types: $($types -join ', '). See build report for the full inventory."
-              }
-            }
-
-            $exe = Get-Item (Join-Path $out "Danica.exe")
-            ("BUILD STATUS: SUCCESS" + $eol + "EXE: " + $exe.FullName + $eol + "Size: " + $exe.Length + " bytes") | Add-Content $report
-            Get-FileHash $exe.FullName -Algorithm SHA256 | ForEach-Object { "SHA256: $($_.Hash)" | Add-Content $report }
-            Get-Content $report
+            & (Join-Path $root "out\Danica.exe") --self-test
+            if ($LASTEXITCODE -ne 0) { throw "The standalone resource self-test failed." }
+            $test = Join-Path $root "Danica-self-test.txt"
+            if (!(Test-Path $test)) { throw "The self-test report was not produced." }
+            Get-Content $test
+            if ((Get-Content $test -Raw) -notmatch "RESULT: PASS") { throw "Embedded resource validation did not pass." }
+            Add-Content (Join-Path $root "build-report.txt") (Get-Content $test)
+            "Standalone resource validation: PASS" | Add-Content (Join-Path $root "build-report.txt")
           }
-          catch {
-            ("BUILD STATUS: FAILED" + $eol + "ERROR: " + $_.Exception.Message) | Add-Content $report
-            Get-Content $report
-            Write-Error $_
-            exit 1
+          finally {
+            Pop-Location
           }
 
-      - name: Upload EXE and build diagnostics
+      - name: Upload the EXE and build report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Danica-Windows-EXE
           path: |
-            out/
+            out/Danica.exe
             build-report.txt
-            build-log.txt
-            danica-file-list.txt
+            Danica-self-test.txt
           if-no-files-found: warn
           retention-days: 30
